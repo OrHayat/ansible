@@ -300,6 +300,81 @@ class TestConnectionBaseClass(unittest.TestCase):
         self.assertRaises(AnsibleError, conn.fetch_file, '/path/to/bad/file', '/remote/path/to/file')
 
 
+# expected values match what `ssh -G` resolves for the same arguments
+@pytest.mark.parametrize('options, expected', (
+    ({'ssh_args': ''}, False),
+    ({'ssh_args': '-t'}, True),
+    ({'ssh_args': '-tt'}, True),
+    ({'ssh_args': '-T'}, False),
+    # RequestTTY values
+    ({'ssh_args': '-o RequestTTY=yes'}, True),
+    ({'ssh_args': '-o RequestTTY=true'}, True),
+    ({'ssh_args': '-o RequestTTY=force'}, True),
+    ({'ssh_args': '-o RequestTTY=no'}, False),
+    ({'ssh_args': '-o RequestTTY=auto'}, False),
+    ({'ssh_args': '-o requesttty=YES'}, True),
+    ({'ssh_args': '-o "RequestTTY =yes"'}, True),
+    ({'ssh_args': '-o "RequestTTY yes"'}, True),
+    ({'ssh_args': '-oRequestTTY=yes'}, True),
+    # missing or unsupported values make ssh fail, so no tty is reported and ssh reports the error
+    ({'ssh_args': '-o RequestTTY'}, False),
+    ({'ssh_args': '-o RequestTTY='}, False),
+    ({'ssh_args': '-o RequestTTY=bogus'}, False),
+    # the first RequestTTY wins
+    ({'ssh_args': '-o RequestTTY=no -o RequestTTY=force'}, False),
+    ({'ssh_args': '-o RequestTTY=force -o RequestTTY=no'}, True),
+    # the last of -t/-T wins
+    ({'ssh_args': '-t -T'}, False),
+    ({'ssh_args': '-T -t'}, True),
+    ({'ssh_args': '-tT'}, False),
+    ({'ssh_args': '-Tt'}, True),
+    ({'ssh_args': '-tt -T'}, False),
+    ({'ssh_args': '-T -tt'}, True),
+    # -t/-T override RequestTTY regardless of position
+    ({'ssh_args': '-o RequestTTY=force -T'}, False),
+    ({'ssh_args': '-T -o RequestTTY=force'}, False),
+    ({'ssh_args': '-t -o RequestTTY=no'}, True),
+    ({'ssh_args': '-o RequestTTY=no -t'}, True),
+    # -t bundled with options the parser does not know
+    ({'ssh_args': '-Att'}, True),
+    ({'ssh_args': '-qtt'}, True),
+    ({'ssh_args': '-vtt'}, True),
+    ({'ssh_args': '-Ctt'}, True),
+    ({'ssh_args': '-ttA'}, True),
+    ({'ssh_args': '-T -Att'}, True),
+    ({'ssh_args': '-A'}, False),
+    ({'ssh_args': '-AT'}, False),
+    ({'ssh_args': '-l root'}, False),
+    ({'ssh_args': '-p 22 -tt'}, True),
+    # all three option sources are scanned, in the order they are passed to ssh
+    ({'ssh_common_args': '-o RequestTTY=yes'}, True),
+    ({'ssh_extra_args': '-o RequestTTY=yes'}, True),
+    ({'ssh_extra_args': '-Att'}, True),
+    ({'ssh_args': '-o RequestTTY=yes', 'ssh_extra_args': '-o ServerAliveInterval=30'}, True),
+    ({'ssh_args': '-o ServerAliveInterval=30', 'ssh_extra_args': '-o RequestTTY'}, False),
+    ({'ssh_args': '-o RequestTTY=force', 'ssh_extra_args': '-T'}, False),
+    ({'ssh_args': '-o RequestTTY=no', 'ssh_extra_args': '-o RequestTTY=force'}, False),
+))
+def test_is_tty_requested(options, expected):
+    conn = connection_loader.get('ssh', PlayContext())
+    conn.get_option = MagicMock(side_effect=lambda opt: options.get(opt, ''))
+
+    assert conn._is_tty_requested() is expected
+
+
+@pytest.mark.parametrize('ssh_args, expected', (
+    ('', True),
+    ('-tt', False),
+    ('-Att', False),
+    ('-o RequestTTY=force -T', True),
+))
+def test_is_pipelining_enabled_tty(ssh_args, expected):
+    conn = connection_loader.get('ssh', PlayContext())
+    conn.set_options(direct={'ssh_args': ssh_args, 'pipelining': True})
+
+    assert conn.is_pipelining_enabled() is expected
+
+
 class MockSelector(object):
     def __init__(self):
         self.files_watched = 0

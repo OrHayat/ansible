@@ -669,7 +669,8 @@ class Connection(ConnectionBase):
         # parser to discover 'passed options', used later on for pipelining resolution
         # exit_on_error=False so malformed args raise ArgumentError instead of calling sys.exit()
         self._tty_parser = argparse.ArgumentParser(exit_on_error=False)
-        self._tty_parser.add_argument('-t', action='count')
+        self._tty_parser.add_argument('-t', dest='tty', action='append_const', const=True)
+        self._tty_parser.add_argument('-T', dest='tty', action='append_const', const=False)
         self._tty_parser.add_argument('-o', action='append')
 
         self._populated_agent: pathlib.Path | None = None
@@ -1596,13 +1597,19 @@ class Connection(ConnectionBase):
                 opts.extend(self._split_ssh_args(attr))
 
         try:
-            args, dummy = self._tty_parser.parse_known_args(opts)
+            args, extra_args = self._tty_parser.parse_known_args(opts)
         except argparse.ArgumentError:
             # malformed args; cannot tell if a tty was requested, ssh itself will report the problem when the command runs
             return False
 
-        if args.t:
+        # bundled options the parser does not know (e.g. -Att) end up in extra_args unsplit; a 't' in them
+        # is treated as a tty request, which may disable pipelining needlessly but never leaves it on with a tty
+        if any(arg.startswith('-') and 't' in arg for arg in extra_args):
             return True
+
+        # -t/-T override RequestTTY, the last one given wins
+        if args.tty:
+            return args.tty[-1]
 
         for arg in args.o or []:
             if '=' in arg:
@@ -1611,8 +1618,8 @@ class Connection(ConnectionBase):
                 val = arg.split(maxsplit=1)
 
             if val[0].lower().strip() == 'requesttty':
-                if val[1].lower().strip() in ('yes', 'force'):
-                    return True
+                # ssh uses the first RequestTTY; a missing or unsupported value is left for ssh to reject
+                return len(val) > 1 and val[1].lower().strip() in ('yes', 'true', 'force')
 
         return False
 

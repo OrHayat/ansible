@@ -1,0 +1,2 @@
+bugfixes:
+  - ssh connection plugin - tty detection for pipelining now matches OpenSSH for ``ssh_args``/``ssh_common_args``/``ssh_extra_args`` - a ``RequestTTY`` option with no value no longer raises an unhandled ``IndexError``, the first ``RequestTTY`` wins, ``RequestTTY=true`` requests a tty, ``-T`` is honored and the last of ``-t``/``-T`` wins, and ``-t`` bundled with other options (e.g. ``-Att``) is detected.
