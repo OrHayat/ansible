@@ -86,6 +86,15 @@ ANSIBLE_SSH_CONTROL_PATH='/tmp/ssh cp with spaces' ansible -m ping all -e ansibl
 ansible -m ping all -e ansible_connection=ssh -e '{"ansible_ssh_extra_args": "-o ServerAliveInterval=30 -o"}' -i test_connection.inventory "$@" 2>&1 \
     | grep 'Failed to connect to the host via ssh: command-line line 0: no argument after keyword'
 
+# ensure the connection is not retried when ssh rejects its own arguments
+output=$(ANSIBLE_SSH_RETRIES=3 ansible -m ping all -e ansible_connection=ssh -e '{"ansible_ssh_extra_args": "-o ServerAliveInterval=30 -o"}' \
+    -i test_connection.inventory -vv "$@" 2>&1 || true)
+grep 'Failed to connect to the host via ssh:' <<< "${output}"
+if grep 'ssh_retry: attempt' <<< "${output}"; then
+    echo "ssh connection was retried after an argument error"
+    exit 1
+fi
+
 # Test that timeout on waiting on become is an unreachable error
 ansible-playbook test_unreachable_become_timeout.yml "$@"
 

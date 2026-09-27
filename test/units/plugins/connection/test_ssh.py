@@ -27,6 +27,7 @@ import unittest
 from unittest.mock import patch, MagicMock, PropertyMock
 from ansible.errors import AnsibleError, AnsibleConnectionFailure, AnsibleFileNotFound
 import shlex
+import subprocess
 from ansible.module_utils.common.text.converters import to_bytes
 from ansible.playbook.play_context import PlayContext
 from ansible.plugins.connection import ssh
@@ -206,6 +207,7 @@ class TestConnectionBaseClass(unittest.TestCase):
         conn = connection_loader.get('ssh', pc)
         conn._build_command = MagicMock()
         conn._bare_run = MagicMock()
+        conn._ssh_rejects_args = MagicMock(return_value=False)
 
         mock_ospe.return_value = True
         conn._build_command.return_value = 'some command to run'
@@ -325,6 +327,7 @@ def mock_run_env(request, mocker):
     conn._send_initial_data = MagicMock()
     conn._examine_output = MagicMock()
     conn._terminate_process = MagicMock()
+    conn._ssh_rejects_args = MagicMock(return_value=False)
     conn._load_name = 'ssh'
     conn.sshpass_pipe = [MagicMock(), MagicMock()]
 
@@ -597,3 +600,102 @@ class TestSSHConnectionRetries(object):
         assert b_stdout == b"my_stdout\nsecond_line"
         assert b_stderr == b"my_stderr"
         assert self.mock_popen.call_count == 2
+
+
+@pytest.fixture
+def arg_check_conn(tmp_path, mocker):
+    """ssh connection whose ssh/scp/sftp runs always fail with rc 255, with retries enabled."""
+    conn = connection_loader.get('ssh', PlayContext())
+    conn.set_option('host', 'myhost')
+    conn.set_option('reconnection_retries', 3)
+    conn.set_option('control_path_dir', str(tmp_path))
+    conn._bare_run = MagicMock(return_value=(255, b'', b'some ssh error'))
+    mocker.patch('ansible.plugins.connection.ssh.os.path.exists', return_value=True)
+    mocker.patch('time.sleep')
+    return conn
+
+
+def mock_arg_check(mocker, returncode=None, side_effect=None):
+    return mocker.patch('ansible.plugins.connection.ssh.subprocess.run', side_effect=side_effect,
+                        return_value=MagicMock(returncode=returncode))
+
+
+class TestSSHConnectionArgumentCheck:
+    def test_rejected_args_are_not_retried(self, arg_check_conn, mocker):
+        check = mock_arg_check(mocker, returncode=255)
+
+        with pytest.raises(ssh._AnsibleSSHArgumentError, match='^Failed to connect to the host via ssh: some ssh error$'):
+            arg_check_conn.exec_command('true')
+
+        assert arg_check_conn._bare_run.call_count == 1
+        assert check.call_count == 1
+
+    @pytest.mark.parametrize('returncode, side_effect', (
+        (0, None),
+        (1, None),
+        (None, subprocess.TimeoutExpired('ssh', 5)),
+        (None, OSError('ssh')),
+    ), ids=('accepted', 'unexpected-rc', 'timeout', 'oserror'))
+    def test_other_failures_are_retried(self, arg_check_conn, mocker, returncode, side_effect):
+        check = mock_arg_check(mocker, returncode=returncode, side_effect=side_effect)
+
+        with pytest.raises(AnsibleConnectionFailure) as ex:
+            arg_check_conn.exec_command('true')
+
+        assert not isinstance(ex.value, ssh._AnsibleSSHArgumentError)
+        assert arg_check_conn._bare_run.call_count == 4
+        assert check.call_count == 1
+
+    @pytest.mark.parametrize('stderr, rejected', (
+        (b"ControlPath too long ('/cp/0123456789' >= 104 bytes)\r\n", True),
+        (b"remote said ControlPath too long ('/cp/0123456789' >= 104 bytes)\r\n", False),
+    ), ids=('controlpath-too-long', 'mid-line'))
+    def test_controlpath_too_long(self, arg_check_conn, mocker, stderr, rejected):
+        check = mock_arg_check(mocker, returncode=0)
+        arg_check_conn._bare_run.return_value = (255, b'', stderr)
+
+        with pytest.raises(AnsibleConnectionFailure) as ex:
+            arg_check_conn.exec_command('true')
+
+        assert isinstance(ex.value, ssh._AnsibleSSHArgumentError) is rejected
+        assert arg_check_conn._bare_run.call_count == (1 if rejected else 4)
+        assert check.call_count == (0 if rejected else 1)
+
+    def test_no_check_without_retries(self, arg_check_conn, mocker):
+        check = mock_arg_check(mocker, returncode=255)
+        arg_check_conn.set_option('reconnection_retries', 0)
+
+        with pytest.raises(AnsibleConnectionFailure):
+            arg_check_conn.exec_command('true')
+
+        assert check.call_count == 0
+
+    def test_check_command(self, arg_check_conn, mocker):
+        check = mock_arg_check(mocker, returncode=255)
+        arg_check_conn.set_option('password', 'secret')
+
+        with pytest.raises(ssh._AnsibleSSHArgumentError):
+            arg_check_conn.exec_command('true')
+
+        cmd = check.call_args.args[0]
+        assert cmd[:4] == [b'ssh', b'-G', b'-o', b'CanonicalizeHostname=no']
+        assert cmd[-1] == b'myhost'
+        assert b'sshpass' not in cmd
+
+    @pytest.mark.parametrize('method', ('sftp', 'scp'))
+    def test_file_transfer_rejected_args_are_not_retried(self, arg_check_conn, mocker, method):
+        mock_arg_check(mocker, returncode=255)
+        arg_check_conn.set_option('ssh_transfer_method', method)
+
+        with pytest.raises(ssh._AnsibleSSHArgumentError, match=f'^Failed to connect to the host via {method}: '):
+            arg_check_conn.put_file('/path/to/in/file', '/path/to/dest/file')
+
+        assert arg_check_conn._bare_run.call_count == 1
+
+    def test_smart_transfer_falls_through(self, arg_check_conn, mocker):
+        """A failure that only affects sftp (e.g. bad sftp_extra_args) must still fall through to scp."""
+        mock_arg_check(mocker, returncode=255)
+        arg_check_conn.set_option('ssh_transfer_method', 'smart')
+        arg_check_conn._bare_run.side_effect = [(255, b'', b'sftp error'), (0, b'', b'')]
+
+        assert arg_check_conn.put_file('/path/to/in/file', '/path/to/dest/file') == (0, b'', b'')

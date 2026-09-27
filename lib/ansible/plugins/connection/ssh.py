@@ -484,6 +484,11 @@ class AnsibleControlPersistBrokenPipeError(AnsibleError):
     pass
 
 
+class _AnsibleSSHArgumentError(AnsibleConnectionFailure):
+    """ ssh rejected its own arguments or configuration """
+    pass
+
+
 def _handle_error(
     remaining_retries: int,
     command: bytes,
@@ -536,6 +541,9 @@ def _handle_error(
                 msg = '{0} <error censored due to no log>'.format(msg)
             else:
                 msg = '{0} {1}'.format(msg, to_native(return_tuple[2]).rstrip())
+            # ssh -G cannot see this one, ssh only checks the socket path length when connecting to the ControlMaster
+            if any(line.startswith(b"ControlPath too long ('") for line in return_tuple[2].splitlines()):
+                raise _AnsibleSSHArgumentError(msg)
             raise AnsibleConnectionFailure(msg)
 
     # For other errors, no exception is raised so the connection is retried and we only log the messages
@@ -559,6 +567,7 @@ def _ssh_retry[**P](
     * ssh returns 255
     Will not retry if
     * sshpass returns 5 (invalid password, to prevent account lockouts)
+    * ssh rejects its own arguments or configuration (retrying cannot fix it)
     * remaining_tries is < 2
     * retries limit reached
     """
@@ -566,6 +575,7 @@ def _ssh_retry[**P](
     def wrapped(self: Connection, *args: P.args, **kwargs: P.kwargs) -> tuple[int, bytes, bytes]:
         remaining_tries = int(self.get_option('reconnection_retries')) + 1
         cmd_summary = u"%s..." % to_text(args[0])
+        args_checked = False
         for attempt in range(remaining_tries):
             try:
                 try:
@@ -593,9 +603,9 @@ def _ssh_retry[**P](
 
                 break
 
-            # 5 = Invalid/incorrect password from sshpass
-            except AnsibleAuthenticationFailure:
-                # Raising this exception, which is subclassed from AnsibleConnectionFailure, prevents further retries
+            # 5 = Invalid/incorrect password from sshpass, or ssh rejected its arguments or configuration
+            except (AnsibleAuthenticationFailure, _AnsibleSSHArgumentError):
+                # Raising these exceptions, which are subclassed from AnsibleConnectionFailure, prevents further retries
                 raise
 
             except (AnsibleConnectionFailure, Exception) as e:
@@ -603,6 +613,13 @@ def _ssh_retry[**P](
                 if attempt == remaining_tries - 1:
                     raise
                 else:
+                    if isinstance(e, AnsibleConnectionFailure) and not args_checked:
+                        # the arguments do not change between attempts, so checking once per retry loop is enough
+                        args_checked = True
+                        if self._ssh_rejects_args():
+                            display.vv(u"ssh_retry: ssh rejected its arguments or configuration, not retrying", host=self.host)
+                            raise _AnsibleSSHArgumentError(e.message) from None
+
                     pause = 2 ** attempt - 1
                     if pause > 30:
                         pause = 30
@@ -1393,6 +1410,27 @@ class Connection(ConnectionBase):
                                                % (self.host, additional))
 
         return (p.returncode, b_stdout, b_stderr)
+
+    def _ssh_rejects_args(self) -> bool:
+        """
+        Returns True if ssh itself rejects the arguments and configuration used for this host.
+
+        ssh exits 255 both for bad arguments and for network failures. `ssh -G` parses the arguments and
+        configuration without connecting, so its return code tells them apart (git uses the same check).
+        CanonicalizeHostname=no comes first to avoid DNS lookups, and the timeout guards against `Match exec`.
+        scp and sftp have no -G, so the ssh level arguments they share are checked.
+        """
+        cmd = self._build_command(self.get_option('ssh_executable'), 'ssh', self.host)
+        cmd[1:1] = [b'-G', b'-o', b'CanonicalizeHostname=no']
+
+        try:
+            result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired) as ex:
+            display.vvv(u'ssh -G argument check failed: %s' % to_text(ex), host=self.host)
+            return False
+
+        return result.returncode == 255
 
     @_ssh_retry
     def _run(self, cmd: list[bytes], in_data: bytes | None, sudoable: bool = True, checkrc: bool = True) -> tuple[int, bytes, bytes]:

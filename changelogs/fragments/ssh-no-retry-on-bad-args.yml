@@ -1,0 +1,2 @@
+bugfixes:
+  - ssh connection plugin - do not retry the connection when ``ssh`` rejects its own arguments or configuration (e.g. malformed ``ssh_args``), since retrying cannot succeed.
